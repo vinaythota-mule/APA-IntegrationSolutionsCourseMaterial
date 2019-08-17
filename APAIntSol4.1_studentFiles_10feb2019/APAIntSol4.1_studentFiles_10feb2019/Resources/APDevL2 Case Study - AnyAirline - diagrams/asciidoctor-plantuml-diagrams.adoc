@@ -1,0 +1,144 @@
+= Generated Asciidoctor/PlantUML Diagrams
+:author: MuleSoft Training
+:email: <gerald.loeffler@mulesoft.com>
+:revdate: 2018-12-11
+:imagesdir: .
+:source-highlighter: pygments
+:source-language: shell
+:pygments-style: perldoc
+:!toc:
+//
+// image magic
+:img: png
+ifdef::backend-html5[]
+:full: width='100%'
+:medium: width='75%'
+:small: width='50%'
+:xsmall: width='25%'
+endif::[]
+ifdef::backend-pdf[]
+:full: pdfwidth='100%'
+:medium: pdfwidth='75%'
+:small: pdfwidth='50%'
+:xsmall: pdfwidth='25%'
+endif::[]
+ifdef::backend-docbook5[]
+:full: scaledwidth='100%'
+:medium: scaledwidth='75%'
+:small: scaledwidth='50%'
+:xsmall: scaledwidth='25%'
+endif::[]
+
+[plantuml, notifications-callbacks, {img}]
+....
+skinparam arrowColor grey
+
+database    "cancelled-flights-exch\nExchange / Topic"       as t
+participant "Flights Management\nSystem API\nImplementation" as c
+participant "Flights Management"                             as s
+
+autonumber
+
+group Register callback at startup
+  c -> s : HTTP PUT /cancellations/register\nX-Callback-Location: callbackURL
+  s -> s : Persist callbackURL
+  note right of s
+    Maintain list of callbackURLs
+    Ignore duplicate callbackURLs
+  end note
+  s -> c : HTTP 202 Accepted
+end
+
+group Deliver notification step 1
+  s -> c : HTTP POST callbackURL\nbody: notification in JSON
+  c -> c : Publish notification to persistent VM queue
+  c -> s : HTTP 200 OK
+end
+
+group Deliver notification step 2
+  note over t,c
+    In one transaction
+    if supported by message broker
+  end note
+  c -> c : Deliver notification from persistent VM queue
+  c -> c : Transform notification to backend-neutral JSON
+  c -> t : Publish notification
+end
+....
+
+[plantuml, check-in, {img}]
+....
+skinparam arrowColor grey
+
+participant "Mobile app"                      as mapp
+participant "Mobile Check-In\nExperience API" as mcieapi
+participant "Check-In\nProcess API"           as cipapi
+participant "Flights Management\nSystem API"  as fmsapi
+participant "Passenger Data\nSystem API"      as pdsapi
+participant "PayPal\nSystem API"              as ppsapi
+participant "Flights Management"              as fm
+database   "Passenger Data"                   as pd
+participant "PayPal"                          as pp
+
+autonumber
+
+mapp    -> mcieapi : HTTP PUT /tickets/{PNR}/checkin\nbody: {"lastName": <LN>, "numBags": <NB>}
+mcieapi -> cipapi  : HTTP PUT /tickets/{PNR}/checkin\nbody: {"lastName": <LN>, "numBags": <NB>}
+
+group Validate check-in attempt and get data
+  group Validate and get flight data
+    cipapi -> fmsapi : HTTP GET /tickets/{PNR}
+    fmsapi -> fm     : SOAP getTicketByPNR(<PNR>)
+    fm     -> fmsapi : SOAP response with ticket holder last name and passport no, origin, destination
+    fmsapi -> cipapi : HTTP 200 OK\nbody:\n{"ticketHolderLastName": <THLN>,\n"ticketHolderPassportNo": <THPN>,\n"origin": <ORI>,\n"destination": <DEST>}
+    cipapi -> cipapi : Assert status 200 and <THLN> == <LN>
+  end
+  group Validate and get passenger data
+    cipapi -> pdsapi : HTTP GET /passengers?passportNo={THPN}
+    pdsapi -> pd     : SQL SELECT loyaltyNo, lastName
+    pd     -> pdsapi : SQL result set
+    pdsapi -> cipapi : HTTP 200 OK\nbody: {"loyaltyNo": <LNO>, "lastName": <PLN>}
+    cipapi -> cipapi : Assert status 200 and <PLN> == <LN>
+  end
+end
+
+group Check-in
+  group Check-in with Flights Management
+    cipapi -> fmsapi : HTTP PUT /tickets/{PNR}/checkin\nbody: {"lastName": <LN>, "numBags": <NB>}
+    fmsapi -> fm     : SOAP checkIn(<PNR>, <LN>, <NB>)
+    fm     -> fmsapi : SOAP response OK
+    fmsapi -> cipapi : HTTP 200 OK
+  end
+  group Register with Passenger Data
+    cipapi -> pdsapi : HTTP POST /passengers/{LNO}/flights\nbody:\n{"date": <now>,\n"origin": <ORI>,\n"destination": <DEST>}
+    pdsapi -> pd     : SQL INSERT date, origin, destination
+    pd     -> pdsapi : SQL result
+    pdsapi -> cipapi : HTTP 200 OK
+  end
+end
+
+group Create Payment for bags
+  cipapi -> ppsapi : HTTP POST /payments\nbody: {"description": <DESC>, "amount": <AMT>}
+  group If no bearer access token or HTTP 401
+    ppsapi -> pp     : HTTP POST /v1/oauth2/token\nAuthorization: clientId:clientSecret
+    pp     -> ppsapi : <AccessToken>
+  end
+  ppsapi -> pp       : HTTP POST /v1/payments/payment\nAuthorization: Bearer <AccessToken>"\nbody: "intent": "sale", "total": <AMT>, "description": <DESC>, ...
+  pp     -> ppsapi   : <PaymentID>, ...
+end
+
+ppsapi  -> cipapi  : HTTP 200 OK\nbody: {"paymentID": <PaymentID>}
+cipapi  -> mcieapi : HTTP 200 OK\nbody: {"paymentID": <PaymentID>}
+mcieapi -> mapp    : HTTP 200 OK\nbody: {"paymentID": <PaymentID>}
+
+group Execute payment after passenger's approval
+  mapp    -> mcieapi : HTTP PUT /tickets/{PNR}/paymentApproval\nbody: {"paymentID": <PaymentID>, "payerID": <PayerID>}
+  mcieapi -> cipapi  : HTTP PUT /tickets/{PNR}/paymentApproval\nbody: {"paymentID": <PaymentID>, "payerID": <PayerID>}
+  cipapi  -> ppsapi  : HTTP PUT /payments/{PaymentID}/approval\nbody: {"payerID": <PayerID>}
+  ppsapi  -> pp      : HTTP POST /v1/payments/payment/{PaymentID}/execute\nAuthorization: Bearer <AccessToken>"\nbody: {"payer_id": <PayerID>}
+  pp      -> ppsapi  : HTTP 200 OK
+  ppsapi  -> cipapi  : HTTP 200 OK
+  cipapi  -> mcieapi : HTTP 200 OK\nbody: boarding pass data
+  mcieapi -> mapp    : HTTP 200 OK\nbody: boarding pass data
+end
+....
